@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import ipaddress
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -18,7 +19,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                PlainTextResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, ingest, search, standards, storage, thumbnails
+from . import __version__, export, ingest, search, standards, storage, thumbnails
 from .audit import log, now_iso
 from .auth import (authenticate, hash_password, login_locked, make_token,
                    note_login_failure, note_login_success, role_at_least,
@@ -178,16 +179,55 @@ def list_assets(
     q: str = "",
     media_type: Optional[str] = None,
     tag: Optional[str] = None,
+    tags: Optional[list[str]] = Query(None),
+    exclude_tags: Optional[list[str]] = Query(None),
     collection_id: Optional[int] = None,
     status: str = "active",
     sort: str = "newest",
     mode: str = "keyword",
-    limit: int = Query(60, le=200),
-    offset: int = 0,
+    limit: int = Query(60, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     user: dict = Depends(require_user),
 ):
-    return search.search(q=q, media_type=media_type, tag=tag, collection_id=collection_id,
-                         status=status, sort=sort, mode=mode, limit=limit, offset=offset)
+    return search.search(q=q, media_type=media_type, tag=tag, tags=tags,
+                         exclude_tags=exclude_tags, collection_id=collection_id,
+                         status=status, sort=sort, mode=mode, limit=limit,
+                         offset=offset)
+
+
+@app.get("/api/assets/export.csv")
+def export_assets_csv(
+    q: str = "",
+    media_type: Optional[str] = None,
+    tag: Optional[str] = None,
+    tags: Optional[list[str]] = Query(None),
+    exclude_tags: Optional[list[str]] = Query(None),
+    collection_id: Optional[int] = None,
+    status: str = "active",
+    sort: str = "newest",
+    user: dict = Depends(require_user),
+):
+    """Download every asset matching the current filters as a CSV manifest.
+
+    Filters and ordering are exactly the list endpoint's; only pagination is
+    omitted, so the export covers the whole match set rather than one page.
+    """
+    rows = search.export_rows(
+        q=q, media_type=media_type, tag=tag, tags=tags,
+        exclude_tags=exclude_tags, collection_id=collection_id,
+        status=status, sort=sort,
+    )
+    body = export.rows_to_csv(rows)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="assets-{stamp}.csv"',
+            "X-Total-Count": str(len(rows)),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 def _get_asset_or_404(uuid: str) -> dict:
@@ -315,6 +355,8 @@ def remove_tag(uuid: str, name: str, user: dict = Depends(require_role("contribu
             "DELETE FROM asset_tags WHERE asset_id = ? AND tag_id = "
             "(SELECT id FROM tags WHERE name = ?)", (a["id"], name.lower()))
     ingest.reindex_fts(a["id"])
+    ingest.reindex_embedding(a["id"])
+    log("tag.remove", user=user, target_type="asset", target_id=uuid, detail=name)
     return {"ok": True}
 
 
